@@ -16,6 +16,7 @@ import type {
 } from './types.ts'
 
 const PROJECTION_BROADCAST_INTERVAL_MS = 16
+const THROUGHPUT_DEBUG = process.env.DSH_SESSION_STREAM_DEBUG === '1'
 
 type ProjectionFrame = Extract<SessionControlFrame, { readonly type: 'projection' }>
 
@@ -86,12 +87,21 @@ export class SessionControlController {
   private readonly streams = new Set<ControlQueue>()
   private readonly projectionBatch = new ProjectionBatch()
   private projectionFlushTimer: ReturnType<typeof setTimeout> | undefined
+  private debugProjectionInput = 0
+  private debugProjectionOutput = 0
+  private debugOtherOutput = 0
+  private readonly debugProjectionKeys = new Map<string, number>()
+  private debugTimer: ReturnType<typeof setInterval> | undefined
 
   /** @param ctx - Host context carrying live Agent, projection, and jobs services. */
   constructor(private readonly ctx: Context) {
     ctx.on('session/event', (session, event) => { this.onSessionEvent(session, event) })
     ctx.inject(['sessionProjections'], (projectionCtx) => {
       projectionCtx.sessionProjections.onChanged((session, key, value, seq) => {
+        if (THROUGHPUT_DEBUG) {
+          this.debugProjectionInput += 1
+          this.debugProjectionKeys.set(key, (this.debugProjectionKeys.get(key) ?? 0) + 1)
+        }
         this.broadcast({
           type: 'projection',
           sessionId: session.id,
@@ -108,7 +118,14 @@ export class SessionControlController {
       const jobs = this.jobsFor(this.ctx.agents.get(session.id))
       if (jobs.length > 0) this.broadcast({ type: 'jobs', sessionId: session.id, jobs })
     })
+    if (THROUGHPUT_DEBUG) {
+      this.debugTimer = setInterval(() => { this.reportDebugThroughput() }, 10_000)
+    }
     ctx.effect(() => () => {
+      if (this.debugTimer !== undefined) {
+        clearInterval(this.debugTimer)
+        this.debugTimer = undefined
+      }
       // Preserve graceful teardown: replacements already admitted before
       // disposal are published before every stream is ended.
       this.flushProjectionBatch()
@@ -237,7 +254,30 @@ export class SessionControlController {
   }
 
   private broadcastNow(frame: SessionControlFrame): void {
+    if (THROUGHPUT_DEBUG) {
+      if (frame.type === 'projection') this.debugProjectionOutput += 1
+      else this.debugOtherOutput += 1
+    }
     for (const stream of this.streams) stream.push(frame)
+  }
+
+  private reportDebugThroughput(): void {
+    const topKeys = [...this.debugProjectionKeys.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 6)
+      .map(([key, count]) => `${key}:${String(count)}`)
+      .join(',')
+    console.error(
+      `[session-throughput] control interval=10s streams=${String(this.streams.size)}`
+      + ` projectionInput=${String(this.debugProjectionInput)}`
+      + ` projectionOutput=${String(this.debugProjectionOutput)}`
+      + ` otherOutput=${String(this.debugOtherOutput)}`
+      + ` topProjectionKeys=${topKeys || '-'}`,
+    )
+    this.debugProjectionInput = 0
+    this.debugProjectionOutput = 0
+    this.debugOtherOutput = 0
+    this.debugProjectionKeys.clear()
   }
 }
 
