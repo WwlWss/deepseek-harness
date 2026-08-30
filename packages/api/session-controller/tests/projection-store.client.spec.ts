@@ -7,7 +7,7 @@
  * seeding, control-stream projection routing pre- and post-instantiation, the
  * list rows' title projection).
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
 import { ProjectionValueStore } from '../src/client/sessions/projection-store.ts'
 import { Session } from '../src/client/sessions/session.ts'
@@ -24,6 +24,10 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
 }
 
 const SID = 'fk-s1' as SessionId
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 describe('Session projection value semantics', () => {
   it('reads undefined until a value lands (capability absence)', () => {
@@ -79,6 +83,32 @@ describe('Session projection value semantics', () => {
     expect(anyTicks).toBe(1)
     store.apply('test/marks', { marks: ['replay'] }, 3)
     await Promise.resolve()
+    expect(keyTicks).toBe(1)
+    expect(anyTicks).toBe(1)
+  })
+
+  it('publishes high-frequency browser changes at most once per animation frame', () => {
+    const frames: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback)
+      return frames.length
+    })
+    const store = new ProjectionValueStore()
+    let keyTicks = 0
+    let anyTicks = 0
+    store.faceOf('test/marks').subscribe(() => { keyTicks += 1 })
+    store.subscribeAny(() => { anyTicks += 1 })
+
+    for (let seq = 1; seq <= 1_000; seq++) {
+      store.apply('test/marks', { marks: [String(seq)] }, seq)
+    }
+
+    expect(store.get('test/marks')).toEqual({ marks: ['1000'] })
+    expect(keyTicks).toBe(0)
+    expect(anyTicks).toBe(0)
+    expect(frames).toHaveLength(2) // one key channel + one any-key channel
+
+    for (const frame of frames.splice(0)) frame(0)
     expect(keyTicks).toBe(1)
     expect(anyTicks).toBe(1)
   })

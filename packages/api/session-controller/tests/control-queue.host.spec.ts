@@ -3,8 +3,9 @@ import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SessionControlController } from '../src/control.ts'
+import type { SessionControlFrame } from '../src/types.ts'
 
 async function harness(): Promise<{
   ctx: Context
@@ -28,6 +29,30 @@ function message(text: string, source: 'user' | 'plugin' = 'user') {
     source: source === 'user' ? { kind: 'user' } : { kind: 'plugin', plugin: 'fixture' },
   })
 }
+
+function projectionFrame(sessionId: SessionId, key: string, seq: number): SessionControlFrame {
+  return { type: 'projection', sessionId, key, value: { seq }, seq }
+}
+
+function emptyQueueFrame(sessionId: SessionId): SessionControlFrame {
+  return { type: 'queue', sessionId, items: [] }
+}
+
+function broadcast(control: SessionControlController, frame: SessionControlFrame): void {
+  ;(control as unknown as { broadcast(frame: SessionControlFrame): void }).broadcast(frame)
+}
+
+async function nextFrame(
+  iterator: AsyncIterator<SessionControlFrame>,
+): Promise<SessionControlFrame> {
+  const next = await iterator.next()
+  if (next.done || next.value === undefined) throw new Error('missing control frame')
+  return next.value
+}
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 describe('Session control queue projection', () => {
   it('projects both pending lists in baselines and live replacement frames', async () => {
@@ -140,5 +165,137 @@ describe('Session control queue projection', () => {
     const second = await iterator.next()
     expect(second).toMatchObject({ done: false, value: { type: 'queue' } })
     await expect(iterator.next()).resolves.toMatchObject({ done: true })
+  })
+
+  it('coalesces a large pending run to the latest projection value', async () => {
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const sessionId = SessionId('queue-session')
+
+    for (let seq = 1; seq <= 100_000; seq++) {
+      broadcast(control, projectionFrame(sessionId, 'subagentTiming', seq))
+    }
+    broadcast(control, emptyQueueFrame(sessionId))
+
+    expect(await nextFrame(iterator)).toMatchObject({
+      type: 'projection', sessionId, key: 'subagentTiming', seq: 100_000,
+    })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'queue', sessionId })
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('rate-limits a fast consumer by batching same-key projection publication', async () => {
+    vi.useFakeTimers()
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const sessionId = SessionId('queue-session')
+    const waiting = iterator.next()
+
+    for (let seq = 1; seq <= 100_000; seq++) {
+      broadcast(control, projectionFrame(sessionId, 'subagentTiming', seq))
+    }
+    await vi.advanceTimersByTimeAsync(15)
+    let settled = false
+    void waiting.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(waiting).resolves.toMatchObject({
+      done: false,
+      value: { type: 'projection', sessionId, key: 'subagentTiming', seq: 100_000 },
+    })
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('never coalesces a projection across a non-projection ordering barrier', async () => {
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const sessionId = SessionId('queue-session')
+
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 10))
+    broadcast(control, emptyQueueFrame(sessionId))
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 11))
+
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'projection', seq: 10 })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'queue' })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'projection', seq: 11 })
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('keeps the last occurrence order when projection keys interleave', async () => {
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const sessionId = SessionId('queue-session')
+
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 10))
+    broadcast(control, projectionFrame(sessionId, 'contextPressure', 20))
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 11))
+    broadcast(control, emptyQueueFrame(sessionId))
+
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'projection', key: 'contextPressure', seq: 20 })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'projection', key: 'subagentTiming', seq: 11 })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'queue' })
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('isolates projection coalescing by session', async () => {
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const firstSession = SessionId('queue-session')
+    const secondSession = SessionId('other-session')
+
+    broadcast(control, projectionFrame(firstSession, 'subagentTiming', 10))
+    broadcast(control, projectionFrame(secondSession, 'subagentTiming', 20))
+    broadcast(control, projectionFrame(firstSession, 'subagentTiming', 11))
+    broadcast(control, emptyQueueFrame(firstSession))
+
+    expect(await nextFrame(iterator)).toMatchObject({
+      type: 'projection', sessionId: secondSession, key: 'subagentTiming', seq: 20,
+    })
+    expect(await nextFrame(iterator)).toMatchObject({
+      type: 'projection', sessionId: firstSession, key: 'subagentTiming', seq: 11,
+    })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'queue' })
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('does not let stale or equal projection seq replace the latest pending value', async () => {
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const sessionId = SessionId('queue-session')
+
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 11))
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 10))
+    broadcast(control, projectionFrame(sessionId, 'subagentTiming', 11))
+    broadcast(control, emptyQueueFrame(sessionId))
+
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'projection', seq: 11 })
+    expect(await nextFrame(iterator)).toMatchObject({ type: 'queue' })
+
+    abort.abort()
+    await iterator.next()
   })
 })
