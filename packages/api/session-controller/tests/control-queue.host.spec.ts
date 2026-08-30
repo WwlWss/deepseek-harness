@@ -3,7 +3,7 @@ import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SessionControlController } from '../src/control.ts'
 import type { SessionControlFrame } from '../src/types.ts'
 
@@ -49,6 +49,10 @@ async function nextFrame(
   if (next.done || next.value === undefined) throw new Error('missing control frame')
   return next.value
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 describe('Session control queue projection', () => {
   it('projects both pending lists in baselines and live replacement frames', async () => {
@@ -179,6 +183,34 @@ describe('Session control queue projection', () => {
       type: 'projection', sessionId, key: 'subagentTiming', seq: 100_000,
     })
     expect(await nextFrame(iterator)).toMatchObject({ type: 'queue', sessionId })
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('rate-limits a fast consumer by batching same-key projection publication', async () => {
+    vi.useFakeTimers()
+    const { control } = await harness()
+    const abort = new AbortController()
+    const iterator = control.control(abort.signal)[Symbol.asyncIterator]()
+    await iterator.next()
+    const sessionId = SessionId('queue-session')
+    const waiting = iterator.next()
+
+    for (let seq = 1; seq <= 100_000; seq++) {
+      broadcast(control, projectionFrame(sessionId, 'subagentTiming', seq))
+    }
+    await vi.advanceTimersByTimeAsync(15)
+    let settled = false
+    void waiting.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(waiting).resolves.toMatchObject({
+      done: false,
+      value: { type: 'projection', sessionId, key: 'subagentTiming', seq: 100_000 },
+    })
 
     abort.abort()
     await iterator.next()
