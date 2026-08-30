@@ -23,6 +23,8 @@ import type {
 
 const DEFAULT_MAX_MESSAGES = 50
 const MESSAGE_TYPES = new Set(['user/message', 'assistant/message'])
+const THROUGHPUT_DEBUG = process.env.DSH_SESSION_STREAM_DEBUG === '1'
+let nextDebugFollowerId = 1
 
 /** Implements cold-safe history operations delegated by the Session Controller. */
 export class SessionHistoryController {
@@ -91,6 +93,31 @@ export class SessionHistoryController {
     const buffered: SessionEvent[] = []
     let snapshotCursor: number | undefined
     let wake: (() => void) | undefined
+    const debugFollowerId = nextDebugFollowerId++
+    let debugProduced = 0
+    let debugYielded = 0
+    let debugPeakBacklog = 0
+    const debugTypes = new Map<string, number>()
+    const reportDebug = (): void => {
+      const topTypes = [...debugTypes.entries()]
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 8)
+        .map(([type, count]) => `${type}:${String(count)}`)
+        .join(',')
+      console.error(
+        `[session-throughput] follow id=${String(debugFollowerId)} target=${target}`
+        + ` interval=10s produced=${String(debugProduced)}`
+        + ` yielded=${String(debugYielded)}`
+        + ` backlog=${String(buffered.length)}`
+        + ` peakBacklog=${String(debugPeakBacklog)}`
+        + ` topTypes=${topTypes || '-'}`,
+      )
+      debugProduced = 0
+      debugYielded = 0
+      debugPeakBacklog = buffered.length
+      debugTypes.clear()
+    }
+    const debugTimer = THROUGHPUT_DEBUG ? setInterval(reportDebug, 10_000) : undefined
     const notify = (): void => {
       const resume = wake
       wake = undefined
@@ -102,9 +129,16 @@ export class SessionHistoryController {
       notify()
     }
     this.closeFollowers.add(close)
+    const recordProduced = (event: SessionEvent): void => {
+      if (!THROUGHPUT_DEBUG) return
+      debugProduced += 1
+      debugTypes.set(event.type, (debugTypes.get(event.type) ?? 0) + 1)
+      debugPeakBacklog = Math.max(debugPeakBacklog, buffered.length)
+    }
     const disposeEvent = this.ctx.on('session/event', (session, event) => {
       if (session.id !== target) return
       buffered.push(event)
+      recordProduced(event)
       notify()
     }, { global: true })
     const disposeCreated = this.ctx.on('session/created', (session) => {
@@ -116,6 +150,7 @@ export class SessionHistoryController {
         ? session.firstLiveSeq
         : snapshotCursor + 1)
       buffered.unshift(...suffix)
+      for (const event of suffix) recordProduced(event)
       notify()
     }, { global: true })
     const onAbort = (): void => { notify() }
@@ -158,9 +193,12 @@ export class SessionHistoryController {
           reject('internal', `session event stream skipped seq ${String(nextSeq)}`, {})
         }
         nextSeq++
+        if (THROUGHPUT_DEBUG) debugYielded += 1
         yield entryFor(item)
       }
     } finally {
+      if (debugTimer !== undefined) clearInterval(debugTimer)
+      if (THROUGHPUT_DEBUG) reportDebug()
       this.closeFollowers.delete(close)
       signal.removeEventListener('abort', onAbort)
       disposeCreated()
@@ -248,7 +286,7 @@ function validateAddress(
     return
   }
   if (header.origin !== 'subagent' || header.parentSession !== address.parentSessionId) {
-    reject('subagent-unauthorized', 'subagent does not belong to the supplied parent', {
+    reject('subagent-unauthorized', 'subagent does not belong to the supplied address', {
       childSessionId: address.childSessionId,
     })
   }
