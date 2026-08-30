@@ -133,14 +133,46 @@ export class SessionControlController {
   }
 }
 
+type ProjectionFrame = Extract<SessionControlFrame, { readonly type: 'projection' }>
+
+interface ControlQueueNode {
+  frame: SessionControlFrame
+  previous?: ControlQueueNode | undefined
+  next?: ControlQueueNode | undefined
+}
+
 class ControlQueue {
-  private readonly buffer: SessionControlFrame[] = []
+  private head: ControlQueueNode | undefined
+  private tail: ControlQueueNode | undefined
+  /** Latest pending node per projection inside the projection-only tail segment. */
+  private readonly pendingProjections = new Map<SessionId, Map<string, ControlQueueNode>>()
   private wake: (() => void) | undefined
   private done = false
 
   push(frame: SessionControlFrame): void {
     if (this.done) return
-    this.buffer.push(frame)
+
+    if (frame.type === 'projection') {
+      let byKey = this.pendingProjections.get(frame.sessionId)
+      const previous = byKey?.get(frame.key)
+      if (previous !== undefined) {
+        const previousFrame = previous.frame as ProjectionFrame
+        if (frame.seq <= previousFrame.seq) return
+        this.unlink(previous)
+      }
+      const node = this.append(frame)
+      if (byKey === undefined) {
+        byKey = new Map()
+        this.pendingProjections.set(frame.sessionId, byKey)
+      }
+      byKey.set(frame.key, node)
+    } else {
+      // A non-projection frame is an ordering barrier. Never coalesce a later
+      // projection across queue/jobs traffic that the consumer has not seen.
+      this.pendingProjections.clear()
+      this.append(frame)
+    }
+
     const wake = this.wake
     this.wake = undefined
     wake?.()
@@ -159,18 +191,55 @@ class ControlQueue {
     signal.addEventListener('abort', onAbort, { once: true })
     try {
       while (!this.done && !signal.aborted) {
-        const frame = this.buffer.shift()
+        const frame = this.shift()
         if (frame !== undefined) {
           yield frame
           continue
         }
         await new Promise<void>((resolve) => { this.wake = resolve })
       }
-      while (this.buffer.length > 0 && !signal.aborted) yield this.buffer.shift() as SessionControlFrame
+      while (this.head !== undefined && !signal.aborted) {
+        const frame = this.shift()
+        if (frame !== undefined) yield frame
+      }
     } finally {
       signal.removeEventListener('abort', onAbort)
       this.end()
     }
+  }
+
+  private append(frame: SessionControlFrame): ControlQueueNode {
+    const node: ControlQueueNode = { frame, previous: this.tail }
+    if (this.tail === undefined) this.head = node
+    else this.tail.next = node
+    this.tail = node
+    return node
+  }
+
+  private shift(): SessionControlFrame | undefined {
+    const node = this.head
+    if (node === undefined) return undefined
+    this.unlink(node)
+
+    const frame = node.frame
+    if (frame.type === 'projection') {
+      const byKey = this.pendingProjections.get(frame.sessionId)
+      if (byKey?.get(frame.key) === node) {
+        byKey.delete(frame.key)
+        if (byKey.size === 0) this.pendingProjections.delete(frame.sessionId)
+      }
+    }
+    return frame
+  }
+
+  private unlink(node: ControlQueueNode): void {
+    const { previous, next } = node
+    if (previous === undefined) this.head = next
+    else previous.next = next
+    if (next === undefined) this.tail = previous
+    else next.previous = previous
+    node.previous = undefined
+    node.next = undefined
   }
 }
 
