@@ -115,8 +115,8 @@ export class ProjectionValueStore {
   }
 
   /**
-   * Subscribe to any-key changes (microtask-batched) — the manager's list
-   * rebuild channel.
+   * Subscribe to any-key changes. Browser publication is animation-frame
+   * batched; runtimes without requestAnimationFrame fall back to a microtask.
    * @param listener - change callback.
    * @returns the unsubscribe function.
    */
@@ -126,6 +126,9 @@ export class ProjectionValueStore {
 
   /**
    * Apply one finished value from the Session control stream.
+   * The row itself changes synchronously, while observer publication is
+   * frame-batched so high-frequency whole-value replacements cannot monopolize
+   * the browser microtask queue.
    * @param key - projection key.
    * @param value - whole value computed by the host unit.
    * @param seq - the unit's watermark at emission.
@@ -175,8 +178,8 @@ export class ProjectionValueStore {
 
   private changed(key: string): void {
     this.valuesCache = undefined
-    this.channels.get(key)?.notifier.markDirty()
-    this.anyNotifier.markDirty()
+    this.channels.get(key)?.notifier.markFrameDirty()
+    this.anyNotifier.markFrameDirty()
   }
 
   private channel(key: string): Channel {
